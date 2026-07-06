@@ -1,0 +1,320 @@
+"""
+Training utilities for force-only PROBE.
+"""
+
+from __future__ import annotations
+
+import copy
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm.auto import tqdm
+
+from .metrics import confusion_matrix_torch, compute_all_metrics
+
+
+def uncertainty_loss_fn(logits: torch.Tensor, targets: torch.Tensor,
+                        n_atoms: torch.Tensor,
+                        class_weights: Optional[torch.Tensor] = None,
+                        label_smoothing: float = 0.0) -> torch.Tensor:
+    """Cross-entropy normalized by sqrt(n_atoms)."""
+    if class_weights is not None:
+        class_weights = class_weights.to(dtype=logits.dtype, device=logits.device)
+    targets = targets.to(device=logits.device)
+    ce = F.cross_entropy(logits, targets, weight=class_weights,
+                         reduction='none', label_smoothing=label_smoothing)
+    normalized = ce / n_atoms.to(dtype=logits.dtype).sqrt().clamp(min=1.0)
+    return normalized.mean()
+
+
+def atom_force_loss_fn(logits_atom: torch.Tensor, targets_atom: torch.Tensor,
+                       atom_mask: torch.Tensor, n_atoms: torch.Tensor,
+                       class_weights=None, label_smoothing: float = 0.0) -> torch.Tensor:
+    """Size-normalized cross-entropy over valid atoms per molecule."""
+    B, N, C = logits_atom.shape
+    logits_flat = logits_atom.reshape(B * N, C)
+    targets_flat = targets_atom.reshape(B * N).to(device=logits_atom.device)
+
+    if class_weights is not None:
+        class_weights = class_weights.to(dtype=logits_atom.dtype,
+                                        device=logits_atom.device)
+    ce = F.cross_entropy(
+        logits_flat, targets_flat, weight=class_weights,
+        reduction='none', label_smoothing=label_smoothing,
+    ).reshape(B, N)
+    ce = ce.masked_fill(~atom_mask, 0.0)
+    per_mol = ce.sum(dim=1) / atom_mask.sum(dim=1).clamp(min=1).float()
+    normalized = per_mol / n_atoms.to(dtype=logits_atom.dtype).sqrt().clamp(min=1.0)
+    return normalized.mean()
+
+
+def force_only_loss_fn(logits_force_atom, logits_force_mol,
+                       target_force_atom, target_force_mol,
+                       atom_mask, n_atoms,
+                       lambda_force_atom=1.0, lambda_force_mol=1.0,
+                       class_weights=None, label_smoothing=0.0) -> dict:
+    loss_fa = atom_force_loss_fn(
+        logits_force_atom, target_force_atom, atom_mask, n_atoms,
+        class_weights, label_smoothing)
+    loss_fs = uncertainty_loss_fn(
+        logits_force_mol, target_force_mol, n_atoms,
+        class_weights, label_smoothing)
+    total = lambda_force_atom * loss_fa + lambda_force_mol * loss_fs
+    return {'total': total, 'force_atom': loss_fa, 'force_mol': loss_fs}
+
+
+def scalar_to_bin_index(errors: torch.Tensor, bin_edges: torch.Tensor) -> torch.Tensor:
+    bin_idx = torch.bucketize(errors, bin_edges, right=False) - 1
+    return torch.clamp(bin_idx, 0, len(bin_edges) - 1)
+
+
+def _force_targets_from_batch(pred_forces, true_forces, atom_mask,
+                              error_bins_f_atom, error_bins_f_mol):
+    from .labels import atom_force_component_mae, structure_mean_force_error
+
+    atom_err = atom_force_component_mae(pred_forces, true_forces)
+    struct_err = structure_mean_force_error(atom_err, atom_mask)
+    target_f_atom = scalar_to_bin_index(atom_err, error_bins_f_atom)
+    target_f_mol = scalar_to_bin_index(struct_err, error_bins_f_mol)
+    return target_f_atom, target_f_mol, struct_err, atom_err
+
+
+def _batch_valid_mask(pred_forces: torch.Tensor) -> torch.Tensor:
+    """True for structures with finite predicted forces."""
+    return torch.isfinite(pred_forces).all(dim=(1, 2))
+
+
+def train_epoch_force_only(model, process_batch_fn, dataloader, optimizer,
+                           error_bins_f_atom, error_bins_f_mol, device,
+                           lambda_force_atom=1.0, lambda_force_mol=1.0,
+                           class_weights=None, label_smoothing=0.0,
+                           gradient_clip_norm=1.0) -> dict:
+    model.train()
+    totals = {'total': 0.0, 'force_atom': 0.0, 'force_mol': 0.0}
+    n_batches = 0
+
+    for batch in tqdm(dataloader, desc='Training', leave=False):
+        (atom_feats, atom_mask, _, _, pred_forces, true_forces, n_atoms) = \
+            process_batch_fn(batch, device)
+
+        valid = _batch_valid_mask(pred_forces)
+        if not valid.any():
+            continue
+
+        atom_feats = atom_feats[valid]
+        atom_mask = atom_mask[valid]
+        pred_forces = pred_forces[valid]
+        true_forces = true_forces[valid]
+        n_atoms = n_atoms[valid]
+
+        target_fa, target_fm, _, _ = _force_targets_from_batch(
+            pred_forces, true_forces, atom_mask,
+            error_bins_f_atom, error_bins_f_mol)
+
+        optimizer.zero_grad()
+        logits_fa, logits_fm = model(atom_feats, atom_mask)
+        losses = force_only_loss_fn(
+            logits_fa, logits_fm, target_fa, target_fm,
+            atom_mask, n_atoms,
+            lambda_force_atom, lambda_force_mol,
+            class_weights, label_smoothing,
+        )
+        losses['total'].backward()
+        if gradient_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+        optimizer.step()
+
+        for k in totals:
+            totals[k] += losses[k].item()
+        n_batches += 1
+
+    denom = max(n_batches, 1)
+    return {k: v / denom for k, v in totals.items()}
+
+
+@torch.no_grad()
+def evaluate_force_only(model, process_batch_fn, dataloader,
+                        error_bins_f_atom, error_bins_f_mol, device,
+                        n_classes: int = 2,
+                        lambda_force_atom: float = 1.0,
+                        lambda_force_mol: float = 1.0,
+                        high_conf_cutoffs: Optional[Dict] = None) -> dict:
+    model.eval()
+    tasks = ('force_atom', 'force_mol')
+    store = {t: {'logits': [], 'targets': [], 'errors': []} for t in tasks}
+    store['force_atom']['batch_losses'] = []
+    all_n_atoms = []
+
+    for batch in tqdm(dataloader, desc='Evaluating', leave=False):
+        (atom_feats, atom_mask, _, _, pred_forces, true_forces, n_atoms) = \
+            process_batch_fn(batch, device)
+
+        valid = _batch_valid_mask(pred_forces)
+        if not valid.any():
+            continue
+
+        atom_feats = atom_feats[valid]
+        atom_mask = atom_mask[valid]
+        pred_forces = pred_forces[valid]
+        true_forces = true_forces[valid]
+        n_atoms_v = n_atoms[valid]
+
+        target_fa, target_fm, err_fm, err_fa = _force_targets_from_batch(
+            pred_forces, true_forces, atom_mask,
+            error_bins_f_atom, error_bins_f_mol)
+
+        logits_fa, logits_fm = model(atom_feats, atom_mask)
+
+        store['force_mol']['logits'].append(logits_fm.cpu())
+        store['force_mol']['targets'].append(target_fm.cpu())
+        store['force_mol']['errors'].append(err_fm.cpu())
+
+        mask_cpu = atom_mask.cpu()
+        store['force_atom']['logits'].append(logits_fa.cpu()[mask_cpu])
+        store['force_atom']['targets'].append(target_fa.cpu()[mask_cpu])
+        store['force_atom']['errors'].append(err_fa.cpu()[mask_cpu])
+        store['force_atom']['batch_losses'].append(
+            atom_force_loss_fn(logits_fa, target_fa, atom_mask, n_atoms_v).item())
+        all_n_atoms.append(n_atoms_v.cpu())
+
+    all_n_atoms = torch.cat(all_n_atoms)
+    results = {'per_task': {}, 'loss': 0.0}
+    loss_sum = 0.0
+    task_lambdas = {'force_atom': lambda_force_atom, 'force_mol': lambda_force_mol}
+
+    for task in tasks:
+        if task == 'force_atom':
+            logits = torch.cat(store['force_atom']['logits'], dim=0)
+            targets = torch.cat(store['force_atom']['targets'], dim=0)
+            errors = torch.cat(store['force_atom']['errors'], dim=0)
+            probs = F.softmax(logits, dim=-1)
+            preds = probs.argmax(dim=-1)
+            cm = confusion_matrix_torch(preds, targets, n_classes)
+            task_loss = float(np.mean(store['force_atom']['batch_losses']))
+        else:
+            logits = torch.cat(store[task]['logits'])
+            targets = torch.cat(store[task]['targets'])
+            errors = torch.cat(store[task]['errors'])
+            probs = F.softmax(logits, dim=-1)
+            preds = probs.argmax(dim=-1)
+            cm = confusion_matrix_torch(preds, targets, n_classes)
+            task_loss = (F.cross_entropy(logits, targets, reduction='none') /
+                         all_n_atoms.float().sqrt().clamp(min=1.0)).mean().item()
+
+        metrics = compute_all_metrics(cm)
+        metrics['loss'] = task_loss
+        metrics['probabilities'] = probs.numpy()
+        metrics['predictions'] = preds.numpy()
+        metrics['targets'] = targets.numpy()
+        metrics['errors'] = errors.numpy()
+
+        if high_conf_cutoffs is not None and task == 'force_mol':
+            from .metrics import high_confidence_analysis
+            metrics['high_conf'] = high_confidence_analysis(
+                probs, preds, targets, high_conf_cutoffs, n_classes)
+
+        results['per_task'][task] = metrics
+        loss_sum += task_lambdas[task] * task_loss
+
+    results['loss'] = loss_sum
+    results['accuracy'] = results['per_task']['force_atom']['accuracy']
+    results['mcc'] = results['per_task']['force_atom']['mcc']
+    results['f1'] = results['per_task']['force_atom']['f1']
+    return results
+
+
+def run_force_only_training(model, process_batch_fn, train_loader, val_loader,
+                            error_bins_f_atom, error_bins_f_mol, device,
+                            output_dir='./probe_outputs',
+                            lr=5e-5, weight_decay=1e-4, epochs=1000,
+                            early_stopping_patience=25, scheduler_patience=5,
+                            scheduler_factor=0.9, min_lr=5e-6,
+                            gradient_clip_norm=1.0,
+                            lambda_force_atom=1.0, lambda_force_mol=1.0,
+                            class_weights=None, label_smoothing=0.0,
+                            high_conf_cutoffs: Optional[Dict] = None) -> dict:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor,
+                                  patience=scheduler_patience, min_lr=min_lr)
+
+    best_val_loss = float('inf')
+    best_state = None
+    best_epoch = 0
+    patience_ctr = 0
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_loss_force_atom': [], 'train_loss_force_mol': [],
+        'val_acc_force_atom': [], 'val_acc_force_mol': [],
+    }
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    for epoch in range(1, epochs + 1):
+        train_losses = train_epoch_force_only(
+            model, process_batch_fn, train_loader, optimizer,
+            error_bins_f_atom, error_bins_f_mol, device,
+            lambda_force_atom, lambda_force_mol,
+            class_weights, label_smoothing, gradient_clip_norm,
+        )
+        val_results = evaluate_force_only(
+            model, process_batch_fn, val_loader,
+            error_bins_f_atom, error_bins_f_mol, device,
+            n_classes=model.n_classes,
+            lambda_force_atom=lambda_force_atom,
+            lambda_force_mol=lambda_force_mol,
+            high_conf_cutoffs=high_conf_cutoffs,
+        )
+        val_loss = val_results['loss']
+        scheduler.step(val_loss)
+
+        history['train_loss'].append(train_losses['total'])
+        history['val_loss'].append(val_loss)
+        history['train_loss_force_atom'].append(train_losses['force_atom'])
+        history['train_loss_force_mol'].append(train_losses['force_mol'])
+        for task in ('force_atom', 'force_mol'):
+            history[f'val_acc_{task}'].append(val_results['per_task'][task]['accuracy'])
+
+        print(
+            f"Epoch {epoch:4d} | train={train_losses['total']:.4f} "
+            f"(Fa={train_losses['force_atom']:.4f}, "
+            f"Fs={train_losses['force_mol']:.4f}) | val={val_loss:.4f} | "
+            f"acc Fa/Fs="
+            f"{val_results['per_task']['force_atom']['accuracy']:.3f}/"
+            f"{val_results['per_task']['force_mol']['accuracy']:.3f} | "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            patience_ctr = 0
+            ckpt_path = output_dir / f'best_force_only_model_{timestamp}.pt'
+            torch.save({
+                'model_state_dict': best_state,
+                'epoch': epoch,
+                'val_loss': val_loss,
+                'val_metrics': val_results,
+                'error_bins_force_atom': error_bins_f_atom.cpu().tolist(),
+                'error_bins_force_mol': error_bins_f_mol.cpu().tolist(),
+                'lambda_force_atom': lambda_force_atom,
+                'lambda_force_mol': lambda_force_mol,
+            }, ckpt_path)
+        else:
+            patience_ctr += 1
+            if patience_ctr >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch} "
+                      f"(best epoch {best_epoch}, val_loss={best_val_loss:.4f})")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    history['best_epoch'] = best_epoch
+    return history
