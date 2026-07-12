@@ -89,6 +89,7 @@ PROBE-force-only/
 │   ├── io_extxyz.py
 │   └── backends/mace.py
 ├── train_mace_force_only.py
+├── infer_mace_force_only.py
 ├── environment_mace.yml
 └── environment_mace_cueq.yml
 ```
@@ -96,6 +97,19 @@ PROBE-force-only/
 ---
 
 ## Inference
+
+## Inference (CLI)
+
+```bash
+python infer_mace_force_only.py \
+  --mace-model /path/to/MACE-OFF23_large.model \
+  --checkpoint /path/to/best_force_only_model_YYYYMMDD_HHMMSS.pt \
+  --test-xyz /path/to/test.xyz \
+  --output-dir ./probe_force_only_inference
+```
+
+Writes `predictions_structure.csv`, `predictions_atom.csv`, `predictions.npz`, and `metrics.json` when reference forces are available.
+
 
 ```python
 import torch
