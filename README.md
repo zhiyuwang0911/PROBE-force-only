@@ -75,6 +75,13 @@ python train_mace_force_only.py \
 
 Labels use the 50th percentile of force component MAE on the training set (class 0 = reliable, class 1 = unreliable). Checkpoint: `output_dir/best_force_only_model_<timestamp>.pt`.
 
+**Resume after walltime / crash:** each epoch also writes `output_dir/last_checkpoint.pt`. Continue without re-scanning force boundaries:
+
+```bash
+python train_mace_force_only.py --resume
+python train_mace_force_only.py --resume /path/to/last_checkpoint.pt --checkpoint-every 1
+```
+
 ---
 
 ## Repository layout
